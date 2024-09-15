@@ -1,21 +1,29 @@
 package main.java.de.bsi;
 
-import main.java.de.bsi.seapi.exceptions.*;
-import main.java.de.bsi.tsesimulator.constants.ASN1Constants;
 import main.java.de.bsi.tsesimulator.constants.Constants;
-import main.java.de.bsi.tsesimulator.exceptions.*;
+import main.java.de.bsi.tsesimulator.exceptions.ECCException;
+import main.java.de.bsi.tsesimulator.exceptions.TLVException;
+import main.java.de.bsi.tsesimulator.exceptions.TR_03111_ECC_V2_1_Exception;
 import main.java.de.bsi.tsesimulator.msg.TransactionLogMessage;
 import main.java.de.bsi.tsesimulator.tlv.TLVObject;
 import main.java.de.bsi.tsesimulator.utils.TR_03111_Utils;
-import main.java.de.bsi.tsesimulator.utils.Utils;
+import org.bouncycastle.asn1.*;
+import org.bouncycastle.asn1.util.ASN1Dump;
+import org.bouncycastle.crypto.digests.SHA384Digest;
+import org.bouncycastle.crypto.params.ECDomainParameters;
+import org.bouncycastle.crypto.params.ECPublicKeyParameters;
+import org.bouncycastle.crypto.signers.ECDSASigner;
 import org.bouncycastle.jce.ECNamedCurveTable;
 import org.bouncycastle.jce.interfaces.ECPublicKey;
 import org.bouncycastle.jce.provider.BouncyCastleProvider;
 import org.bouncycastle.jce.spec.ECNamedCurveParameterSpec;
 import org.bouncycastle.jce.spec.ECPublicKeySpec;
 import org.bouncycastle.math.ec.ECPoint;
+import org.bouncycastle.util.Arrays;
 import org.bouncycastle.util.encoders.Base64;
 
+import java.io.ByteArrayOutputStream;
+import java.io.FileOutputStream;
 import java.io.IOException;
 import java.math.BigInteger;
 import java.security.*;
@@ -27,77 +35,83 @@ import static main.java.de.bsi.tsesimulator.constants.Constants.ECDSA_PLAIN_SHA_
 public class App {
     public static void main(String[] args) throws Exception {
         Security.addProvider(new BouncyCastleProvider());
-        PublicKey publicKey = getPublicKey();
-
-        TransactionLogMessage trxLogMessage = new TransactionLogMessage();
-        trxLogMessage.setVersion(0);
-        trxLogMessage.setCertifiedDatatype(Constants.TRANSACTION_LOG_OID);
-        trxLogMessage.setOperationtype("finishTransaction");
-        trxLogMessage.setClientID("0CF54B11725");
-        trxLogMessage.setProcessData("Beleg^49.99_0.00_0.00_0.00_0.00^49.99:Unbar".getBytes());
-        trxLogMessage.setProcessType("Kassenbeleg-V1");
-        trxLogMessage.setTransactionNumber(406967L);
-        trxLogMessage.setSerialNumber(calculateSerialNumber(publicKey));
-        trxLogMessage.setAlgorithm(ECDSA_PLAIN_SHA_384);
-
-        //Signature Counter
-        TLVObject signatureCounterElement = new TLVObject();
-        signatureCounterElement.setTagWithByteElement(ASN1Constants.UNIVERSAL_INTEGER);
-        signatureCounterElement.setValueWithLongElement(874925L);
-        byte[] signatureCounterAsTLV = signatureCounterElement.toTLVByteArray();
-
-        // Log Time
-        TLVObject logTimeElement = new TLVObject();
-        logTimeElement.setTagWithByteElement(ASN1Constants.UNIVERSAL_INTEGER);
-        logTimeElement.setValueWithLongElement(ZonedDateTime.parse("2023-02-27T11:40:22.000Z").toEpochSecond());
-        byte[] logTimeAsTLV = logTimeElement.toTLVByteArray();
-
-        byte[] signatureReconstructed = Utils.concatAnyNumberOfByteArrays(trxLogMessage.toMinorTLVByteArray(), signatureCounterAsTLV, logTimeAsTLV);
-
-        TLVObject signatureValueElement = new TLVObject();
-        signatureValueElement.setTagWithByteElement(ASN1Constants.UNIVERSAL_OCTET_STRING);
-        signatureValueElement.setValue(signatureReconstructed);
-        byte[] signatureAsTLV = signatureValueElement.toTLVByteArray();
-        byte[] lowerTransactionLogMessageByteArray=Utils.concatAnyNumberOfByteArrays(signatureCounterAsTLV,logTimeAsTLV, signatureAsTLV);
-        byte[] upperTransactionLogMessageByteArray = trxLogMessage.toMinorTLVByteArray();
-
-//        concat the upper and the lower part and store it in another byte array
-        byte[] message = Utils.concatTwoByteArrays(upperTransactionLogMessageByteArray, lowerTransactionLogMessageByteArray);
-
 
         byte[] signatureOnReceipt = Base64.decode("EeucLEfm1f6MW6Hp1J8F+vuiXrVkC6dtNDSV5jsi5aRlt+KQQeLsQ0BQnkquJW9aNkWodr5zmHLZObtzb0WBReUed+q3/0beYLYYqGSxrDyOGCycQg928VA1vkSjVcPX");
-        boolean valid = verify(signatureOnReceipt, signatureReconstructed, (ECPublicKey) publicKey);
-        System.out.println("Is valid: " + valid);
-        valid = verifySignature(publicKey, message, signatureOnReceipt);
-        System.out.println("Is valid: " + valid);
+        ECPublicKey publicKey = getPublicKey("BCESZvlxgnvDUjdWA4lLrKsCsKXmnFkSIn9Hp70ov8Le+ST5oNHTiIJTF6ypPIwedE7k5DbJsDsmSScF7ivJHY0+B9ptVjkqkFh9XWv3VuEZnz0jG/VqnBTgp7Vt2l2x7g==");
 
+        int version = 2;
+        // certifiedDataType
+        String operationType = "FinishTransaction";
+        String clientId = "0CF54B11725";
+        String processData = "Beleg^49.99_0.00_0.00_0.00_0.00^49.99:Unbar";
+        String processType = "Kassenbeleg-V1";
+        int transactionNumber = 406967;
+        int signatureCounter = 874925;
+        long logTime = ZonedDateTime.parse("2023-02-27T11:40:33.000Z").toEpochSecond();
+        byte[] serialnumber = calculateSerialNumber(publicKey);
+        System.out.println("SerialNumber as Hex: " + bytesToHex(serialnumber));
+
+        // --------------------------------------------------------------------------------------------------------------
+        // According to TR-03151.pdf we need to concatenate several values:
+        // message M := version||certifiedDataType||certifiedData||serialNumber||signatureAlgorithm||seAuditData||signatureCounter||logTime
+        // verificationResult := VerifySignatureFunction (keypublic, sig, M, signatureAlgorithm)
+
+        ASN1EncodableVector trxLogMessageVector = new ASN1EncodableVector();
+        trxLogMessageVector.add(new ASN1Integer(version));
+        trxLogMessageVector.add(new ASN1ObjectIdentifier(Constants.TRANSACTION_LOG_OID));
+        trxLogMessageVector.add(new DERTaggedObject(false, 0x80, new DERPrintableString(operationType))); // Tag 0x80
+        trxLogMessageVector.add(new DERTaggedObject(false, 0x81, new DERPrintableString(clientId)));      // Tag 0x81
+        trxLogMessageVector.add(new DERTaggedObject(false, 0x82, encodeIndefiniteLength(processData)));    // Tag 0x82
+        trxLogMessageVector.add(new DERTaggedObject(false, 0x83, new DERPrintableString(processType)));    // Tag 0x83
+        trxLogMessageVector.add(new DERTaggedObject(false, 0x85, new ASN1Integer(transactionNumber)));
+        trxLogMessageVector.add(new DEROctetString(serialnumber));
+        ASN1EncodableVector signatureAlgorithmSeq = new ASN1EncodableVector();
+        signatureAlgorithmSeq.add(new ASN1ObjectIdentifier(ECDSA_PLAIN_SHA_384));
+        ASN1Sequence signatureAlgorithm = new DERSequence(signatureAlgorithmSeq);
+        trxLogMessageVector.add(signatureAlgorithm);
+        trxLogMessageVector.add(new ASN1Integer(signatureCounter));
+        trxLogMessageVector.add(new ASN1Integer(logTime));
+
+        // Erstelle die SEQUENCE für die gesamte Log Message
+//        ASN1Sequence logMessage = new DERSequence(trxLogMessageVector);
+        // Konvertiere die ASN.1-Daten in ein Byte-Array (DER-encoded)
+//        byte[] message = logMessage.getEncoded();
+
+        TransactionLogMessage transactionLogMessage = new TransactionLogMessage(clientId, processData.getBytes(), processType, null, transactionNumber, serialnumber);
+        transactionLogMessage.setOperationtype(operationType);
+        transactionLogMessage.setAlgorithm(ECDSA_PLAIN_SHA_384);
+        byte[] result2 = transactionLogMessage.toMinorTLVByteArray();
+        result2 = concatenate(result2, trxLogMessageVector.get(9).toASN1Primitive().getEncoded());
+        result2 = concatenate(result2, trxLogMessageVector.get(10).toASN1Primitive().getEncoded());
+
+        saveDERFile(result2, "message.der");
+//        ASN1Primitive asn1Object = logMessage.toASN1Primitive();
+//        System.out.println(ASN1Dump.dumpAsString(asn1Object, true));
+
+        // --------------------------------------------------------------------------------------------------------------
+
+//        listAllAlgorithms();
+        boolean validSimple = verifySignature(publicKey, result2, signatureOnReceipt);
+        System.out.println("Is valid: " + validSimple);
     }
 
-    private static PublicKey getPublicKey() throws NoSuchAlgorithmException, NoSuchProviderException, InvalidKeySpecException, IOException {
-        // Beispiel: Base64-codierter öffentlicher Schlüssel (dein Base64-String hier einfügen)
-        String base64PublicKey = "BCESZvlxgnvDUjdWA4lLrKsCsKXmnFkSIn9Hp70ov8Le+ST5oNHTiIJTF6ypPIwedE7k5DbJsDsmSScF7ivJHY0+B9ptVjkqkFh9XWv3VuEZnz0jG/VqnBTgp7Vt2l2x7g==";
+    public static void saveDERFile(byte[] data, String filename) throws IOException {
+        try (FileOutputStream fos = new FileOutputStream(filename)) {
+            fos.write(data);
+        }
+    }
+
+    private static ECPublicKey getPublicKey(String base64PublicKey) throws InvalidKeySpecException, NoSuchAlgorithmException, NoSuchProviderException {
         byte[] publicKeyBytes = Base64.decode(base64PublicKey);
-
-        // Spezifikation der Kurve brainpoolP512r1
         ECNamedCurveParameterSpec ecSpec = ECNamedCurveTable.getParameterSpec("brainpoolP384r1");
-
-        // Den öffentlichen Punkt erzeugen
         org.bouncycastle.math.ec.ECPoint Q = ecSpec.getCurve().decodePoint(publicKeyBytes);
-
-        // Erstellen des öffentlichen Schlüsselspezifikationsobjekts
         ECPublicKeySpec pubKeySpec = new ECPublicKeySpec(Q, ecSpec);
-
-        // Laden des KeyFactory-Objekts für ECDSA mit BouncyCastle
         KeyFactory keyFactory = KeyFactory.getInstance("ECDSA", "BC");
-
-        // Erstellen des öffentlichen Schlüssels
         PublicKey publicKey = keyFactory.generatePublic(pubKeySpec);
-        return publicKey;
+        return (ECPublicKey) publicKey;
     }
 
-    private static byte[] calculateSerialNumber(PublicKey pubKeyAsKey) {
-        //get the public key that is used by the CryptoCore's signature algorithm
-        //save the public key as a TLV encoded byte array
+    private static byte[] extractPubKeyContent(PublicKey pubKeyAsKey) {
         byte[] wholePubKeyInfoByte = pubKeyAsKey.getEncoded();
         //decode that TLV encoded byte array to a TLVObject array
         TLVObject[] wholePubKeyInfoTLV = null;
@@ -115,10 +129,16 @@ public class App {
         //so let's get rid of those leading zeroes!
         byte[] publicKeyValue = new byte[publicKeyValueWithLeadingZeroes.length-1];
         System.arraycopy(publicKeyValueWithLeadingZeroes, 1, publicKeyValue, 0, publicKeyValue.length);
+        return publicKeyValue;
+    }
+
+    private static byte[] calculateSerialNumber(PublicKey pubKeyAsKey) {
+        //get the public key that is used by the CryptoCore's signature algorithm
+        //save the public key as a TLV encoded byte array
+        byte[] publicKeyValue = extractPubKeyContent(pubKeyAsKey);
 
 
         //add the BC provider for good measure again (should already have been added, but better safe than sorry)
-        Security.addProvider(new BouncyCastleProvider());
         MessageDigest md = null;
         try {
             //get a SHA256 message digest from the bouncycastle provider
@@ -132,7 +152,7 @@ public class App {
         //feed the publicKeyValue to the message digest
         md.update(publicKeyValue);
         byte[] hashedPublicKey = md.digest();
-        System.out.println(bytesToHex(hashedPublicKey));
+
         return hashedPublicKey;
     }
 
@@ -148,10 +168,80 @@ public class App {
         return hexString.toString();
     }
 
-    public static boolean verify(byte[] signature, byte[] message, ECPublicKey publicKey) throws ECCException, TR_03111_ECC_V2_1_Exception {
+
+    public static boolean verifySignature(PublicKey publicKey, byte[] message, byte[] signatureBytes) throws Exception {
+        Signature signature = Signature.getInstance("SHA384WITHPLAIN-ECDSA", "BC");
+        signature.initVerify(publicKey);
+        signature.update(message);
+        return signature.verify(signatureBytes);
+    }
+
+    public static void listAllAlgorithms(){
+        // Alle registrierten Security Provider auflisten
+        for (Provider provider : Security.getProviders()) {
+            System.out.println("Provider: " + provider.getName());
+            for (Provider.Service service : provider.getServices()) {
+                if (service.getType().equals("MessageDigest")) {
+                    System.out.println(" - Hash Algorithm: " + service.getAlgorithm());
+                }
+                if (service.getType().equals("Signature")) {
+                    System.out.println(" - Signature Algorithm: " + service.getAlgorithm());
+                }
+            }
+        }
+    }
+
+    private static ASN1OctetString encodeIndefiniteLength(String processData) throws IOException {
+        ByteArrayOutputStream baos = new ByteArrayOutputStream();
+        baos.write(processData.getBytes());  // Schreibe den Prozess-Dateninhalt
+        baos.write(0x00);  // End-Of-Contents Marker für indefinite length encoding
+        baos.write(0x00);
+        return new BEROctetString(baos.toByteArray());  // BEROctetString für indefinite length
+    }
+
+    private static boolean verifyECDSASignature(byte[] publicKeyValue, byte[] message, byte[] signatureBytes) throws Exception {
+        // Verwende die elliptische Kurve brainpoolP384r1 als Beispiel
         ECNamedCurveParameterSpec ecSpec = ECNamedCurveTable.getParameterSpec("brainpoolP384r1");
+
+        // Erstelle den ECPoint aus dem extrahierten Public Key-Wert
+        ECPoint Q = ecSpec.getCurve().decodePoint(publicKeyValue);
+        ECDomainParameters domainParams = new ECDomainParameters(
+                ecSpec.getCurve(), ecSpec.getG(), ecSpec.getN(), ecSpec.getH(), ecSpec.getSeed()
+        );
+
+        // Initialisiere den Public Key-Parameter für die Verifizierung
+        ECPublicKeyParameters pubKeyParams = new ECPublicKeyParameters(Q, domainParams);
+
+        // Erstelle den ECDSA-Signer
+        ECDSASigner signer = new ECDSASigner();
+        signer.init(false, pubKeyParams);
+
+
+        // Erstelle den Hash der Nachricht (SHA-384)
+        SHA384Digest digest = new SHA384Digest();
+        digest.update(message, 0, message.length);
+        byte[] hash = new byte[digest.getDigestSize()];
+        digest.doFinal(hash, 0);
+
+        // Splitte die Signatur in R und S (ECDSA Signatur besteht aus zwei Werten: R und S)
+        byte[] r = Arrays.copyOfRange(signatureBytes, 0, signatureBytes.length / 2);
+        byte[] s = Arrays.copyOfRange(signatureBytes, signatureBytes.length / 2, signatureBytes.length);
+
+        // Verifiziere die Signatur (R und S)
+        return signer.verifySignature(hash, new BigInteger(1, r), new BigInteger(1, s));
+    }
+
+    public static byte[] concatenate(byte[] first, byte[] second) {
+        byte[] result = new byte[first.length + second.length];
+        System.arraycopy(first, 0, result, 0, first.length);
+        System.arraycopy(second, 0, result, first.length, second.length);
+        return result;
+    }
+
+    public static boolean verify(ECPublicKey publicKey, byte[] message, byte[] signature) throws ECCException, TR_03111_ECC_V2_1_Exception {
         boolean isVerified = false;
         //define everything that can be defined at this point of the program
+        ECNamedCurveParameterSpec ecSpec = ECNamedCurveTable.getParameterSpec("brainpoolP384r1");
         BigInteger n = ecSpec.getN();										//domain parameter n
         BigInteger nMinusOne = ecSpec.getN().subtract(BigInteger.ONE); 		//nMinusOne = domain parameter n minus 1
         ECPoint generatorG = ecSpec.getG();									//domain parameter G
@@ -202,8 +292,8 @@ public class App {
         MessageDigest md = null;
 
         try {
-            //TODO dynamic
-            md = MessageDigest.getInstance("SHA3-384", "BC");
+
+            md = MessageDigest.getInstance("SHA3-384", BouncyCastleProvider.PROVIDER_NAME);
             //check, if length of the output of the hash function in bits < bit length of the order of the base point
             //if yes, that is illegal according to BSI TR-03111 V2.1
             if((md.getDigestLength()*8) < tau) {
@@ -264,12 +354,5 @@ public class App {
         }
 
         return isVerified;
-    }
-
-    public static boolean verifySignature(PublicKey publicKey, byte[] message, byte[] signatureBytes) throws Exception {
-        Signature signature = Signature.getInstance("SHA3-384withECDSA", "BC");
-        signature.initVerify(publicKey);
-        signature.update(message);
-        return signature.verify(signatureBytes);
     }
 }
